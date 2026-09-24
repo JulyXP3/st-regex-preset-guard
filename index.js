@@ -596,9 +596,13 @@ function init() {
     // 与官方一致：lastKnownGlobalIds 保持 null，页面加载后的首次切换不弹未保存提醒
     currentPresetId = getPresets().find(p => p.isSelected)?.id ?? null;
 
-    // 捕获阶段监听：先于官方（注册在控件本体）执行，且不依赖扩展加载顺序
-    document.addEventListener('change', onCaptureChange, true);
-    document.addEventListener('click', onCaptureClick, true);
+    // 捕获阶段监听：挂在 window 上（路径顺序上 window 必然先于 document 和控件本体）。
+    // 必须用 window 而不是 document：实测 cocktail 扩展的 regex-refresh-optimizer 在
+    // document 捕获阶段拦截 #regex_presets 的 change 并 stopImmediatePropagation，
+    // 随后自行调用官方 applyPresetById 做全类型同步（含危险写盘）；挂在 document 上
+    // 会因注册顺序靠后而永远收不到事件，只有 window 层能抢在它前面。
+    window.addEventListener('change', onCaptureChange, true);
+    window.addEventListener('click', onCaptureClick, true);
     injectPanel();
 
     console.log(TAG, '已加载：正则预设切换只同步全局正则，不再改写角色卡与预设文件。');
