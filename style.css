@@ -34,6 +34,11 @@
     cursor: pointer;
 }
 
+#regexbak_fix {
+    white-space: nowrap;
+    align-self: center;
+}
+
 #regexbak_block input[type="checkbox"] {
     display: inline-block !important;
     width: auto !important;
