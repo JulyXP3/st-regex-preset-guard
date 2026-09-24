@@ -1,4 +1,4 @@
-# st-regexpresetguard（正则预设守卫）
+# st-regex-preset-guard（正则预设守卫）
 
 SillyTavern 正则预设行为修复扩展（外置扩展，不修改酒馆任何源码）。
 
@@ -19,7 +19,7 @@ SillyTavern（实测 v1.17.x）的「正则预设」功能有一个坑：**切�
 把整个文件夹（含 `manifest.json`）拷贝或克隆到：
 
 ```
-SillyTavern/public/scripts/extensions/third-party/st-regexpresetguard
+SillyTavern/public/scripts/extensions/third-party/st-regex-preset-guard
 ```
 
 刷新页面，在「扩展」面板里启用。

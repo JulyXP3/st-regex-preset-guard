@@ -1,9 +1,9 @@
 {
-  "display_name": "st-regexpresetguard",
+  "display_name": "st-regex-preset-guard",
   "loading_order": 1100,
   "js": "index.js",
   "author": "JulyXp3",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "auto_update": false,
   "minimum_client_version": "1.17.0"
 }
