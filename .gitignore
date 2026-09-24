@@ -2,6 +2,9 @@
 *.md
 !README.md
 
+# 本地测试产物
+/test-backups/
+
 # 系统杂项
 Thumbs.db
 Desktop.ini
