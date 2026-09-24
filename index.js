@@ -12,11 +12,13 @@
 // 兼容目标：E:\SillyTavern（1.17.0）。控件 ID 在 1.18.0 未变；若未来官方改版导致
 // 控件缺失，拦截自然不生效（安全降级），体检面板也不注入。
 
-import { characters, getCurrentChatId, getRequestHeaders, reloadCurrentChat, saveSettingsDebounced, this_chid } from '../../../script.js';
-import { extension_settings } from '../../../scripts/extensions.js';
-import { Popup } from '../../../scripts/popup.js';
-import { openai_setting_names, openai_settings } from '../../../scripts/openai.js';
-import { escapeHtml, uuidv4 } from '../../../scripts/utils.js';
+// 注意：第三方扩展在 third-party/ 下多一层目录，官方扩展的三层相对路径（../../../script.js）
+// 在这里会解析到 /scripts/script.js 而加载失败；本生态的通行做法是用站点绝对路径。
+import { characters, getCurrentChatId, getRequestHeaders, reloadCurrentChat, saveSettingsDebounced, this_chid } from '/script.js';
+import { extension_settings } from '/scripts/extensions.js';
+import { Popup } from '/scripts/popup.js';
+import { openai_setting_names, openai_settings } from '/scripts/openai.js';
+import { escapeHtml, uuidv4 } from '/scripts/utils.js';
 
 const TAG = '[regex_bak]';
 const SELECT_ID = 'regex_presets';
