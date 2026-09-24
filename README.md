@@ -57,10 +57,11 @@ SillyTavern/public/scripts/extensions/third-party/st-regex-preset-guard
 
 - 以 SillyTavern **v1.17.0** 实测通过；v1.18.0 相关控件 ID 未变，预期可用（升级后建议复验一次）。
 - 不依赖 cocktail；有 cocktail 则接管其正则预设优化，没有则拦截官方原生行为。
-- 扩展真正加载完成的标志：浏览器控制台出现 `[regex_bak] 已加载：正则预设切换只同步全局正则，不再改写角色卡与预设文件。`
+- 扩展真正加载完成的标志：浏览器控制台出现 `[st-regex-preset-guard] 已加载：正则预设切换只同步全局正则，不再改写角色卡与预设文件。`
 
 ## 版本
 
+- **v1.1.1 ~ v1.1.3** 定名 `st-regex-preset-guard`（正则预设守卫）：GitHub 仓库、本地目录、控制台日志前缀同步更名。
 - **v1.1.0** 移除内置「存量体检」面板（对实际使用场景属过度设计），扩展瘦身为纯拦截。旧代码见 Git 历史。
 - v1.0.x 初版至 v1.0.7：拦截逻辑修复（绝对路径导入、window 捕获层、PresetManager API）与体检面板迭代。
 

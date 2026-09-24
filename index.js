@@ -1,4 +1,4 @@
-// regex_bak —— 正则预设行为修复扩展
+// st-regex-preset-guard —— 正则预设行为修复扩展
 //
 // 唯一职责：拦截官方「正则预设」切换控件，把切换行为改为"仅同步全局正则"。
 //
@@ -21,7 +21,7 @@ import { extension_settings } from '/scripts/extensions.js';
 import { Popup } from '/scripts/popup.js';
 import { uuidv4 } from '/scripts/utils.js';
 
-const TAG = '[regex_bak]';
+const TAG = '[st-regex-preset-guard]';
 const SELECT_ID = 'regex_presets';
 const BTN_CREATE = 'regex_preset_create';
 const BTN_UPDATE = 'regex_preset_update';
