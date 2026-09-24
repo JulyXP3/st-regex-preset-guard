@@ -1,0 +1,8 @@
+# 除 README.md 外的 md 文档一律不入库（含 AGENTS.md，按其自身约定）
+*.md
+!README.md
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
+.DS_Store

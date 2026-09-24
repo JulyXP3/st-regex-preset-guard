@@ -1,0 +1,38 @@
+#regexbak_block {
+    padding: 5px 0;
+}
+
+#regexbak_block small {
+    display: block;
+    opacity: 0.75;
+    margin: 3px 0;
+}
+
+#regexbak_status {
+    font-size: 0.9rem;
+    align-self: center;
+}
+
+#regexbak_report {
+    margin-top: 5px;
+}
+
+.regexbak-source {
+    margin: 8px 0 4px 2px;
+}
+
+.regexbak-source ul {
+    margin: 2px 0 4px 22px;
+    list-style: circle;
+}
+
+.regexbak-backup {
+    font-size: 0.85rem;
+    opacity: 0.75;
+    margin: 0 0 2px 22px;
+}
+
+.regexbak-restore-one {
+    cursor: pointer;
+    text-decoration: underline;
+}
