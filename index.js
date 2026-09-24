@@ -17,7 +17,8 @@
 import { characters, getCurrentChatId, getRequestHeaders, reloadCurrentChat, saveSettingsDebounced, this_chid } from '/script.js';
 import { extension_settings } from '/scripts/extensions.js';
 import { Popup } from '/scripts/popup.js';
-import { openai_setting_names, openai_settings } from '/scripts/openai.js';
+import { getPresetManager } from '/scripts/preset-manager.js';
+import { saveScriptsByType, SCRIPT_TYPES } from '/scripts/extensions/regex/engine.js';
 import { escapeHtml, uuidv4 } from '/scripts/utils.js';
 
 const TAG = '[regex_bak]';
@@ -296,33 +297,42 @@ async function fetchAllCharacters() {
 
 async function scanSources() {
     const report = [];
+    const stats = { chars: 0, presets: 0 };
 
     for (const ch of await fetchAllCharacters()) {
         const scripts = ch?.data?.extensions?.regex_scripts;
         if (!Array.isArray(scripts)) {
             continue;
         }
+        stats.chars++;
         const items = scripts.filter(s => s?.disabled === true).map(s => ({ id: s.id, name: s.scriptName }));
         if (items.length) {
             report.push({ kind: 'char', key: `char:${ch.avatar}`, label: `${ch.name || ch.avatar}（${ch.avatar}）`, avatar: ch.avatar, items });
         }
     }
 
-    // 聊天预设全量在页面加载时已进内存（openai_settings），与磁盘文件一致
-    if (Array.isArray(openai_setting_names)) {
-        for (const name of openai_setting_names) {
-            const scripts = openai_settings?.[name]?.extensions?.regex_scripts;
-            if (!Array.isArray(scripts)) {
-                continue;
-            }
-            const items = scripts.filter(s => s?.disabled === true).map(s => ({ id: s.id, name: s.scriptName }));
-            if (items.length) {
-                report.push({ kind: 'preset', key: `preset:${name}`, label: `${name}（聊天预设）`, presetName: name, items });
-            }
+    // 聊天预设：走 PresetManager 正规 API。
+    // 注意：不要用 openai.js 的 openai_settings/openai_setting_names 全局变量——1.17 里
+    // 初始化后它们分别是"按下标排列的数组"和"名字→下标的对象"，按名字直查永远 undefined。
+    const manager = getPresetManager();
+    const { presets, preset_names } = manager.getPresetList();
+    const names = Array.isArray(preset_names)
+        ? preset_names.slice()
+        : Object.keys(preset_names ?? {});
+    stats.presets = names.length;
+    for (const name of names) {
+        const index = Array.isArray(preset_names) ? preset_names.indexOf(name) : preset_names[name];
+        const scripts = presets?.[index]?.extensions?.regex_scripts;
+        if (!Array.isArray(scripts)) {
+            continue;
+        }
+        const items = scripts.filter(s => s?.disabled === true).map(s => ({ id: s.id, name: s.scriptName }));
+        if (items.length) {
+            report.push({ kind: 'preset', key: `preset:${name}`, label: `${name}（聊天预设）`, presetName: name, items });
         }
     }
 
-    return report;
+    return { report, stats };
 }
 
 // ---- 修复与还原
@@ -373,14 +383,20 @@ async function repairCharacter(source, checkedIds) {
 }
 
 async function repairPreset(source, checkedIds) {
-    const preset = openai_settings?.[source.presetName];
+    const manager = getPresetManager();
+    const preset = manager.getCompletionPresetByName(source.presetName);
     const scripts = preset?.extensions?.regex_scripts;
     if (!preset || !Array.isArray(scripts)) {
         throw new Error(`找不到预设 ${source.presetName}`);
     }
     await backupPut({ key: source.key, kind: 'preset', presetName: source.presetName, label: source.label, ts: Date.now(), preset: structuredClone(preset) });
     scripts.forEach(s => { if (checkedIds.has(s.id)) { s.disabled = false; } });
-    // /api/presets/save 是整文件替换，所以备份必须存完整预设对象（上面已存）
+    if (manager.getSelectedPresetName() === source.presetName) {
+        // 当前预设：走官方写入通道，同步内存 oai_settings.extensions 与预设文件
+        await saveScriptsByType(scripts, SCRIPT_TYPES.PRESET);
+        return;
+    }
+    // 非当前预设：直接整文件写回（/api/presets/save 是整文件替换，备份必须存完整预设对象——上面已存）
     const res = await fetch('/api/presets/save', {
         method: 'POST',
         headers: getRequestHeaders(),
@@ -415,6 +431,15 @@ async function restoreFromBackup(sourceKey) {
         });
         if (!res.ok) {
             throw new Error(`预设 ${rec.presetName} 还原失败（HTTP ${res.status}）`);
+        }
+        // 同步内存中的预设对象；若是当前预设，还需走官方通道刷新 oai_settings.extensions
+        const manager = getPresetManager();
+        const live = manager.getCompletionPresetByName(rec.presetName);
+        if (live) {
+            Object.assign(live, rec.preset);
+        }
+        if (manager.getSelectedPresetName() === rec.presetName && Array.isArray(rec.preset?.extensions?.regex_scripts)) {
+            await saveScriptsByType(rec.preset.extensions.regex_scripts, SCRIPT_TYPES.PRESET);
         }
     }
     toastr.success(`已把「${rec.label}」还原到 ${fmtTime(rec.ts)} 的备份`);
@@ -470,11 +495,13 @@ async function onScanClick() {
     const $status = $('#regexbak_status');
     try {
         $status.text('扫描中…');
-        lastScanReport = await scanSources();
+        const { report, stats } = await scanSources();
+        lastScanReport = report;
         const total = lastScanReport.reduce((n, src) => n + src.items.length, 0);
         renderReport();
         await refreshBackupBadges();
-        $status.text(lastScanReport.length ? `发现 ${lastScanReport.length} 个来源、共 ${total} 条被关闭` : '未发现问题');
+        const coverage = `已扫描 ${stats.chars} 张带正则的角色卡、${stats.presets} 个聊天预设`;
+        $status.text(lastScanReport.length ? `${coverage}；发现 ${lastScanReport.length} 个来源、共 ${total} 条被关闭` : `${coverage}；未发现问题`);
     } catch (err) {
         console.error(TAG, err);
         $status.text('扫描失败');
@@ -522,7 +549,7 @@ async function onFixClick() {
                 errors.push(String(err.message || err));
             }
         }
-        lastScanReport = await scanSources();
+        lastScanReport = (await scanSources()).report;
         renderReport();
         await refreshBackupBadges();
         const remain = lastScanReport.reduce((n, src) => n + src.items.length, 0);
