@@ -280,6 +280,16 @@ async function backupGet(key) {
     });
 }
 
+async function backupAll() {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction('backups', 'readonly');
+        const rq = tx.objectStore('backups').getAll();
+        rq.onsuccess = () => resolve(rq.result ?? []);
+        rq.onerror = () => reject(rq.error);
+    });
+}
+
 // ---- 扫描（只读）
 
 async function fetchAllCharacters() {
@@ -449,6 +459,30 @@ async function restoreFromBackup(sourceKey) {
 
 let lastScanReport = [];
 
+/** 常驻备份列表：与扫描报告解耦——恢复成功后来源会从报告中消失，反悔入口必须仍可达 */
+async function renderBackups() {
+    const $box = $('#regexbak_backups');
+    if (!$box.length) {
+        return;
+    }
+    let records = [];
+    try {
+        records = await backupAll();
+    } catch (err) {
+        console.error(TAG, err);
+        return;
+    }
+    if (!records.length) {
+        $box.html('<small>暂无备份。</small>').show();
+        return;
+    }
+    const rows = records
+        .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
+        .map(rec => `<div class="regexbak-bk">${escapeHtml(rec.label ?? rec.key)} — ${fmtTime(rec.ts)} <a class="regexbak-restore-one" data-key="${escapeHtml(rec.key)}" href="javascript:void(0)">还原到此备份</a></div>`)
+        .join('');
+    $box.html(`<b>备份与还原</b>（每来源只留最近一次）<div>${rows}</div>`).show();
+}
+
 function renderReport() {
     const $report = $('#regexbak_report');
     if (!lastScanReport.length) {
@@ -502,6 +536,7 @@ async function onScanClick() {
         await refreshBackupBadges();
         const coverage = `已扫描 ${stats.chars} 张带正则的角色卡、${stats.presets} 个聊天预设`;
         $status.text(lastScanReport.length ? `${coverage}；发现 ${lastScanReport.length} 个来源、共 ${total} 条被关闭` : `${coverage}；未发现问题`);
+        await renderBackups();
     } catch (err) {
         console.error(TAG, err);
         $status.text('扫描失败');
@@ -554,6 +589,7 @@ async function onFixClick() {
         await refreshBackupBadges();
         const remain = lastScanReport.reduce((n, src) => n + src.items.length, 0);
         $status.text(`已恢复 ${fixed} 条；剩余被关闭 ${remain} 条（原状态已备份进浏览器）`);
+        await renderBackups();
         if (errors.length) {
             toastr.error(errors.join('；'));
         } else {
@@ -570,14 +606,26 @@ function bindPanelEvents() {
         $(this).closest('.regexbak-source').find('.regexbak-item').prop('checked', this.checked);
     });
     $('#regexbak_report').on('click', '#regexbak_fix', () => void onFixClick());
-    $('#regexbak_report').on('click', '.regexbak-restore-one', function () {
+    // 还原入口在报告和常驻备份区都可能出现，委托到整个体检块
+    $('#regexbak_block').on('click', '.regexbak-restore-one', function () {
         if (repairing) {
             return;
         }
         repairing = true;
         void restoreFromBackup($(this).data('key'))
             .catch(err => { console.error(TAG, err); toastr.error(String(err.message || err)); })
-            .finally(() => { repairing = false; });
+            .finally(() => {
+                repairing = false;
+                void (async () => {
+                    try {
+                        lastScanReport = (await scanSources()).report;
+                        renderReport();
+                        await refreshBackupBadges();
+                    } finally {
+                        await renderBackups();
+                    }
+                })();
+            });
     });
 }
 
@@ -606,9 +654,11 @@ function injectPanel(retries = 60) {
             <div id="regexbak_scan" class="menu_button fa-solid fa-magnifying-glass" title="扫描存量数据"></div>
             <span id="regexbak_status" class="flex1"></span>
         </div>
-        <div id="regexbak_report" style="display:none;"></div>`;
+        <div id="regexbak_report" style="display:none;"></div>
+        <div id="regexbak_backups" style="margin-top:5px;"></div>`;
     anchor.after(block);
     bindPanelEvents();
+    void renderBackups();
 }
 
 // ------------------------------------------------------------------ 启动
