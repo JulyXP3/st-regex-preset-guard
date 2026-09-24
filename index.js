@@ -1,32 +1,31 @@
 // regex_bak —— 正则预设行为修复扩展
 //
-// 根因与方案见仓库根目录文档《正则预设问题分析.md》《方案-正则预设修复扩展.md》。
-// 本扩展不修改酒馆任何源码，行为全部通过两个手段实现：
-//  1) 模块A：在 document 捕获阶段拦截正则预设控件（#regex_presets 等），官方处理函数
-//     不会执行；切换预设改为"仅同步全局正则"，绝不调用 merge-attributes（角色卡）
-//     与 /api/presets/save（聊天预设文件），从根上消灭"局部/预设内嵌正则被批量关闭"。
-//  2) 模块B：存量体检面板（注入在正则扩展面板里），扫描被官方逻辑写入 disabled=true
-//     的局部/预设内嵌正则，人工勾选恢复；恢复前把原状态备份进 IndexedDB
-//     （每来源只留最近一次，自动覆盖），面板可一键还原到备份。
+// 唯一职责：拦截官方「正则预设」切换控件，把切换行为改为"仅同步全局正则"。
 //
-// 兼容目标：E:\SillyTavern（1.17.0）。控件 ID 在 1.18.0 未变；若未来官方改版导致
-// 控件缺失，拦截自然不生效（安全降级），体检面板也不注入。
+// 为什么要拦截：官方 RegexPresetManager（本机上由 cocktail 的 regex-refresh-optimizer
+// 抢先劫持执行）在切换正则预设时，会把局部（角色卡内）与预设内嵌（聊天预设文件内）
+// 正则中"不在清单里的"批量写成 disabled=true 并立即写盘；上下文错配（保存快照时的
+// 角色/聊天预设与切换时不同）或导入换 UUID 都会导致整批误杀。
+//
+// 怎么拦截：监听器挂在 window 捕获阶段——事件传播路径上 window 必然先于 document
+// 和控件本体（与注册顺序无关），从而抢在 cocktail（document 捕获层）和官方（控件层）
+// 之前接管。拦截后只按预设快照翻转全局正则的 disabled，绝不调用
+// merge-attributes（角色卡）与 /api/presets/save（聊天预设文件）。
+//
+// v1.1.0 起移除「存量体检」面板：对用户场景属过度设计（误关的正则切到对应预设
+// 用官方批量启用即可恢复；删除的内容酒馆无版本历史，任何工具都无法找回）。
+// 旧版本代码可从 Git 历史找回。
 
-// 注意：第三方扩展在 third-party/ 下多一层目录，官方扩展的三层相对路径（../../../script.js）
-// 在这里会解析到 /scripts/script.js 而加载失败；本生态的通行做法是用站点绝对路径。
-import { characters, getCurrentChatId, getRequestHeaders, reloadCurrentChat, saveSettingsDebounced, this_chid } from '/script.js';
+import { getCurrentChatId, reloadCurrentChat, saveSettingsDebounced } from '/script.js';
 import { extension_settings } from '/scripts/extensions.js';
 import { Popup } from '/scripts/popup.js';
-import { getPresetManager } from '/scripts/preset-manager.js';
-import { saveScriptsByType, SCRIPT_TYPES } from '/scripts/extensions/regex/engine.js';
-import { escapeHtml, uuidv4 } from '/scripts/utils.js';
+import { uuidv4 } from '/scripts/utils.js';
 
 const TAG = '[regex_bak]';
 const SELECT_ID = 'regex_presets';
 const BTN_CREATE = 'regex_preset_create';
 const BTN_UPDATE = 'regex_preset_update';
 const BTN_APPLY = 'regex_preset_apply';
-const IDB_NAME = 'regex_bak_backup';
 
 // ------------------------------------------------------------------ 运行时状态
 
@@ -34,8 +33,6 @@ const IDB_NAME = 'regex_bak_backup';
 let currentPresetId = null;
 /** 上次应用/保存时的全局启用清单；null = 尚未应用过，首次切换不弹未保存提醒（与官方一致） */
 let lastKnownGlobalIds = null;
-/** 体检恢复是否进行中（防并发点击） */
-let repairing = false;
 
 // ------------------------------------------------------------------ 小工具
 
@@ -58,13 +55,6 @@ function idsChanged(a, b) {
     const known = new Set(b);
     return a.some(id => !known.has(id));
 }
-
-function fmtTime(ts) {
-    return new Date(ts).toLocaleString();
-}
-
-// ================================================================== 模块 A
-// 拦截官方正则预设控件，替换为"仅全局严格同步"
 
 function renderPresetList() {
     const select = document.getElementById(SELECT_ID);
@@ -202,7 +192,7 @@ function onCaptureChange(event) {
     if (event.target?.id !== SELECT_ID) {
         return;
     }
-    // 捕获阶段截停，官方监听器（注册在 select 本体上）不再执行
+    // 捕获阶段截停：cocktail（document 捕获层）与官方（控件层）的监听器都不再执行
     event.stopPropagation();
     const value = event.target.value;
     if (!value) {
@@ -246,421 +236,6 @@ function onCaptureClick(event) {
     }
 }
 
-// ================================================================== 模块 B
-// 存量体检：扫描 / 报告 / 勾选恢复 / IndexedDB 备份与还原
-
-// ---- IndexedDB（备份每来源只留最近一次，put 同 key 自动覆盖）
-
-function idbOpen() {
-    return new Promise((resolve, reject) => {
-        const req = indexedDB.open(IDB_NAME, 1);
-        req.onupgradeneeded = () => req.result.createObjectStore('backups', { keyPath: 'key' });
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-    });
-}
-
-async function backupPut(record) {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction('backups', 'readwrite');
-        tx.objectStore('backups').put(record);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-    });
-}
-
-async function backupGet(key) {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction('backups', 'readonly');
-        const rq = tx.objectStore('backups').get(key);
-        rq.onsuccess = () => resolve(rq.result ?? null);
-        rq.onerror = () => reject(rq.error);
-    });
-}
-
-async function backupAll() {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction('backups', 'readonly');
-        const rq = tx.objectStore('backups').getAll();
-        rq.onsuccess = () => resolve(rq.result ?? []);
-        rq.onerror = () => reject(rq.error);
-    });
-}
-
-// ---- 扫描（只读）
-
-async function fetchAllCharacters() {
-    const res = await fetch('/api/characters/all', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({}),
-    });
-    if (!res.ok) {
-        throw new Error(`角色卡列表获取失败（HTTP ${res.status}）`);
-    }
-    const list = await res.json();
-    return Array.isArray(list) ? list : [];
-}
-
-async function scanSources() {
-    const report = [];
-    const stats = { chars: 0, presets: 0 };
-
-    for (const ch of await fetchAllCharacters()) {
-        const scripts = ch?.data?.extensions?.regex_scripts;
-        if (!Array.isArray(scripts)) {
-            continue;
-        }
-        stats.chars++;
-        const items = scripts.filter(s => s?.disabled === true).map(s => ({ id: s.id, name: s.scriptName }));
-        if (items.length) {
-            report.push({ kind: 'char', key: `char:${ch.avatar}`, label: `${ch.name || ch.avatar}（${ch.avatar}）`, avatar: ch.avatar, items });
-        }
-    }
-
-    // 聊天预设：走 PresetManager 正规 API。
-    // 注意：不要用 openai.js 的 openai_settings/openai_setting_names 全局变量——1.17 里
-    // 初始化后它们分别是"按下标排列的数组"和"名字→下标的对象"，按名字直查永远 undefined。
-    const manager = getPresetManager();
-    const { presets, preset_names } = manager.getPresetList();
-    const names = Array.isArray(preset_names)
-        ? preset_names.slice()
-        : Object.keys(preset_names ?? {});
-    stats.presets = names.length;
-    for (const name of names) {
-        const index = Array.isArray(preset_names) ? preset_names.indexOf(name) : preset_names[name];
-        const scripts = presets?.[index]?.extensions?.regex_scripts;
-        if (!Array.isArray(scripts)) {
-            continue;
-        }
-        const items = scripts.filter(s => s?.disabled === true).map(s => ({ id: s.id, name: s.scriptName }));
-        if (items.length) {
-            report.push({ kind: 'preset', key: `preset:${name}`, label: `${name}（聊天预设）`, presetName: name, items });
-        }
-    }
-
-    return { report, stats };
-}
-
-// ---- 修复与还原
-
-/** 角色卡修复后同步内存中的角色对象（对齐官方 writeExtensionField 的三处回填） */
-function syncMemoryCharacter(avatar, scripts) {
-    const ch = characters.find(c => c?.avatar === avatar);
-    if (!ch?.data) {
-        return;
-    }
-    ch.data.extensions = ch.data.extensions ?? {};
-    ch.data.extensions.regex_scripts = scripts;
-    try {
-        const json = JSON.parse(ch.json_data ?? '{}');
-        json.data = json.data ?? {};
-        json.data.extensions = json.data.extensions ?? {};
-        json.data.extensions.regex_scripts = scripts;
-        ch.json_data = JSON.stringify(json);
-    } catch {
-        // json_data 不是合法 JSON 时不阻塞修复，仅跳过该回填
-    }
-    if (characters[this_chid] === ch) {
-        const field = document.getElementById('character_json_data');
-        if (field && field.value !== ch.json_data) {
-            field.value = ch.json_data;
-        }
-    }
-}
-
-async function repairCharacter(source, checkedIds) {
-    const fresh = (await fetchAllCharacters()).find(c => c.avatar === source.avatar);
-    const scripts = fresh?.data?.extensions?.regex_scripts;
-    if (!Array.isArray(scripts)) {
-        throw new Error(`找不到角色 ${source.avatar}`);
-    }
-    // 备份先落库（原样、含开关状态），再动数据
-    await backupPut({ key: source.key, kind: 'char', avatar: source.avatar, label: source.label, ts: Date.now(), scripts: structuredClone(scripts) });
-    scripts.forEach(s => { if (checkedIds.has(s.id)) { s.disabled = false; } });
-    const res = await fetch('/api/characters/merge-attributes', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({ avatar: source.avatar, data: { extensions: { regex_scripts: scripts } } }),
-    });
-    if (!res.ok) {
-        throw new Error(`角色 ${source.avatar} 写回失败（HTTP ${res.status}）`);
-    }
-    syncMemoryCharacter(source.avatar, scripts);
-}
-
-async function repairPreset(source, checkedIds) {
-    const manager = getPresetManager();
-    const preset = manager.getCompletionPresetByName(source.presetName);
-    const scripts = preset?.extensions?.regex_scripts;
-    if (!preset || !Array.isArray(scripts)) {
-        throw new Error(`找不到预设 ${source.presetName}`);
-    }
-    await backupPut({ key: source.key, kind: 'preset', presetName: source.presetName, label: source.label, ts: Date.now(), preset: structuredClone(preset) });
-    scripts.forEach(s => { if (checkedIds.has(s.id)) { s.disabled = false; } });
-    if (manager.getSelectedPresetName() === source.presetName) {
-        // 当前预设：走官方写入通道，同步内存 oai_settings.extensions 与预设文件
-        await saveScriptsByType(scripts, SCRIPT_TYPES.PRESET);
-        return;
-    }
-    // 非当前预设：直接整文件写回（/api/presets/save 是整文件替换，备份必须存完整预设对象——上面已存）
-    const res = await fetch('/api/presets/save', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({ apiId: 'openai', name: source.presetName, preset }),
-    });
-    if (!res.ok) {
-        throw new Error(`预设 ${source.presetName} 写回失败（HTTP ${res.status}）`);
-    }
-}
-
-async function restoreFromBackup(sourceKey) {
-    const rec = await backupGet(sourceKey);
-    if (!rec) {
-        toastr.warning('该来源还没有备份');
-        return;
-    }
-    if (rec.kind === 'char') {
-        const res = await fetch('/api/characters/merge-attributes', {
-            method: 'POST',
-            headers: getRequestHeaders(),
-            body: JSON.stringify({ avatar: rec.avatar, data: { extensions: { regex_scripts: rec.scripts } } }),
-        });
-        if (!res.ok) {
-            throw new Error(`角色 ${rec.avatar} 还原失败（HTTP ${res.status}）`);
-        }
-        syncMemoryCharacter(rec.avatar, rec.scripts);
-    } else {
-        const res = await fetch('/api/presets/save', {
-            method: 'POST',
-            headers: getRequestHeaders(),
-            body: JSON.stringify({ apiId: 'openai', name: rec.presetName, preset: rec.preset }),
-        });
-        if (!res.ok) {
-            throw new Error(`预设 ${rec.presetName} 还原失败（HTTP ${res.status}）`);
-        }
-        // 同步内存中的预设对象；若是当前预设，还需走官方通道刷新 oai_settings.extensions
-        const manager = getPresetManager();
-        const live = manager.getCompletionPresetByName(rec.presetName);
-        if (live) {
-            Object.assign(live, rec.preset);
-        }
-        if (manager.getSelectedPresetName() === rec.presetName && Array.isArray(rec.preset?.extensions?.regex_scripts)) {
-            await saveScriptsByType(rec.preset.extensions.regex_scripts, SCRIPT_TYPES.PRESET);
-        }
-    }
-    toastr.success(`已把「${rec.label}」还原到 ${fmtTime(rec.ts)} 的备份`);
-}
-
-// ---- 面板 UI（注入到正则扩展面板，避开 Popup 交互复杂度）
-
-let lastScanReport = [];
-
-/** 常驻备份列表：与扫描报告解耦——恢复成功后来源会从报告中消失，反悔入口必须仍可达 */
-async function renderBackups() {
-    const $box = $('#regexbak_backups');
-    if (!$box.length) {
-        return;
-    }
-    let records = [];
-    try {
-        records = await backupAll();
-    } catch (err) {
-        console.error(TAG, err);
-        return;
-    }
-    if (!records.length) {
-        $box.html('<small>暂无备份。</small>').show();
-        return;
-    }
-    const rows = records
-        .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
-        .map(rec => `<div class="regexbak-bk">${escapeHtml(rec.label ?? rec.key)} — ${fmtTime(rec.ts)} <a class="regexbak-restore-one" data-key="${escapeHtml(rec.key)}" href="javascript:void(0)">还原到此备份</a></div>`)
-        .join('');
-    $box.html(`<b>备份与还原</b>（每来源只留最近一次）<div>${rows}</div>`).show();
-}
-
-function renderReport() {
-    const $report = $('#regexbak_report');
-    if (!lastScanReport.length) {
-        $report.html('<small>未发现被写为"关闭"的局部/预设内嵌正则。</small>').show();
-        return;
-    }
-    const rows = lastScanReport.map(src => {
-        const items = src.items.map(it =>
-            `<li><label><input type="checkbox" class="regexbak-item" data-key="${escapeHtml(src.key)}" data-id="${escapeHtml(it.id)}"> ${escapeHtml(it.name || '(未命名正则)')}</label></li>`,
-        ).join('');
-        return `<div class="regexbak-source">
-            <label><input type="checkbox" class="regexbak-src" data-key="${escapeHtml(src.key)}"> <b>${src.kind === 'char' ? '[角色卡]' : '[聊天预设]'} ${escapeHtml(src.label)}</b> — ${src.items.length} 条被关闭</label>
-            <div class="regexbak-backup" data-key="${escapeHtml(src.key)}">备份：无</div>
-            <ul>${items}</ul>
-        </div>`;
-    }).join('');
-    $report.html(`
-        <div class="flex-container alignItemsBaseline">
-            <strong class="flex1">勾选要恢复的正则（自己故意关过的不要勾）</strong>
-            <div id="regexbak_fix" class="menu_button" title="把勾选的正则恢复为开启；恢复前自动把原状态备份进浏览器">恢复勾选项</div>
-        </div>
-        ${rows}`).show();
-    // 回填各来源已有备份的显示
-    $report.find('.regexbak-backup').each(async function () {
-        const key = $(this).data('key');
-        const rec = await backupGet(key);
-        if (rec) {
-            $(this).html(`备份：${fmtTime(rec.ts)} <a class="regexbak-restore-one" data-key="${escapeHtml(key)}" href="javascript:void(0)">还原到此备份</a>`);
-        }
-    });
-}
-
-async function refreshBackupBadges() {
-    for (const el of $('#regexbak_report .regexbak-backup')) {
-        const $el = $(el);
-        const rec = await backupGet($el.data('key'));
-        if (rec) {
-            $el.html(`备份：${fmtTime(rec.ts)} <a class="regexbak-restore-one" data-key="${escapeHtml($el.data('key'))}" href="javascript:void(0)">还原到此备份</a>`);
-        }
-    }
-}
-
-async function onScanClick() {
-    const $status = $('#regexbak_status');
-    try {
-        $status.text('扫描中…');
-        const { report, stats } = await scanSources();
-        lastScanReport = report;
-        const total = lastScanReport.reduce((n, src) => n + src.items.length, 0);
-        renderReport();
-        await refreshBackupBadges();
-        const coverage = `已扫描 ${stats.chars} 张带正则的角色卡、${stats.presets} 个聊天预设`;
-        $status.text(lastScanReport.length ? `${coverage}；发现 ${lastScanReport.length} 个来源、共 ${total} 条被关闭` : `${coverage}；未发现问题`);
-        await renderBackups();
-    } catch (err) {
-        console.error(TAG, err);
-        $status.text('扫描失败');
-        toastr.error(String(err.message || err));
-    }
-}
-
-async function onFixClick() {
-    if (repairing) {
-        return;
-    }
-    const byKey = new Map();
-    $('#regexbak_report .regexbak-item:checked').each(function () {
-        const key = $(this).data('key');
-        if (!byKey.has(key)) {
-            byKey.set(key, new Set());
-        }
-        byKey.get(key).add($(this).data('id'));
-    });
-    if (!byKey.size) {
-        toastr.warning('先勾选要恢复的正则');
-        return;
-    }
-
-    repairing = true;
-    const $status = $('#regexbak_status');
-    $status.text('恢复中…（请勿同时编辑对应角色/预设）');
-    try {
-        let fixed = 0;
-        const errors = [];
-        for (const [key, checkedIds] of byKey) {
-            const source = lastScanReport.find(src => src.key === key);
-            if (!source) {
-                continue;
-            }
-            try {
-                if (source.kind === 'char') {
-                    await repairCharacter(source, checkedIds);
-                } else {
-                    await repairPreset(source, checkedIds);
-                }
-                fixed += checkedIds.size;
-            } catch (err) {
-                console.error(TAG, err);
-                errors.push(String(err.message || err));
-            }
-        }
-        lastScanReport = (await scanSources()).report;
-        renderReport();
-        await refreshBackupBadges();
-        const remain = lastScanReport.reduce((n, src) => n + src.items.length, 0);
-        $status.text(`已恢复 ${fixed} 条；剩余被关闭 ${remain} 条（原状态已备份进浏览器）`);
-        await renderBackups();
-        if (errors.length) {
-            toastr.error(errors.join('；'));
-        } else {
-            toastr.success(`已恢复 ${fixed} 条，备份存于浏览器（IndexedDB）`);
-        }
-    } finally {
-        repairing = false;
-    }
-}
-
-function bindPanelEvents() {
-    $('#regexbak_scan').on('click', () => void onScanClick());
-    $('#regexbak_report').on('change', '.regexbak-src', function () {
-        $(this).closest('.regexbak-source').find('.regexbak-item').prop('checked', this.checked);
-    });
-    $('#regexbak_report').on('click', '#regexbak_fix', () => void onFixClick());
-    // 还原入口在报告和常驻备份区都可能出现，委托到整个体检块
-    $('#regexbak_block').on('click', '.regexbak-restore-one', function () {
-        if (repairing) {
-            return;
-        }
-        repairing = true;
-        void restoreFromBackup($(this).data('key'))
-            .catch(err => { console.error(TAG, err); toastr.error(String(err.message || err)); })
-            .finally(() => {
-                repairing = false;
-                void (async () => {
-                    try {
-                        lastScanReport = (await scanSources()).report;
-                        renderReport();
-                        await refreshBackupBadges();
-                    } finally {
-                        await renderBackups();
-                    }
-                })();
-            });
-    });
-}
-
-function injectPanel(retries = 60) {
-    if (document.getElementById('regexbak_block')) {
-        return;
-    }
-    const anchor = document.getElementById('regex_presets_block');
-    if (!anchor) {
-        if (retries > 0) {
-            setTimeout(() => injectPanel(retries - 1), 500);
-        } else {
-            console.warn(TAG, '未找到正则扩展面板，体检功能未注入（拦截功能不受影响）');
-        }
-        return;
-    }
-    const block = document.createElement('div');
-    block.id = 'regexbak_block';
-    block.innerHTML = `
-        <hr />
-        <div class="flex-container alignItemsBaseline">
-            <strong class="flex1">regex_bak 存量体检</strong>
-        </div>
-        <small>扫描被正则预设误写为"关闭"的角色卡/预设内嵌正则（只读）。恢复前自动把原状态备份进浏览器（每来源只留最近一次，自动覆盖，不下载文件）。扫描/恢复时请勿同时编辑对应角色或预设。</small>
-        <div class="flex-container marginTop5">
-            <div id="regexbak_scan" class="menu_button fa-solid fa-magnifying-glass" title="扫描存量数据"></div>
-            <span id="regexbak_status" class="flex1"></span>
-        </div>
-        <div id="regexbak_report" style="display:none;"></div>
-        <div id="regexbak_backups" style="margin-top:5px;"></div>`;
-    anchor.after(block);
-    bindPanelEvents();
-    void renderBackups();
-}
-
 // ------------------------------------------------------------------ 启动
 
 function init() {
@@ -673,14 +248,8 @@ function init() {
     // 与官方一致：lastKnownGlobalIds 保持 null，页面加载后的首次切换不弹未保存提醒
     currentPresetId = getPresets().find(p => p.isSelected)?.id ?? null;
 
-    // 捕获阶段监听：挂在 window 上（路径顺序上 window 必然先于 document 和控件本体）。
-    // 必须用 window 而不是 document：实测 cocktail 扩展的 regex-refresh-optimizer 在
-    // document 捕获阶段拦截 #regex_presets 的 change 并 stopImmediatePropagation，
-    // 随后自行调用官方 applyPresetById 做全类型同步（含危险写盘）；挂在 document 上
-    // 会因注册顺序靠后而永远收不到事件，只有 window 层能抢在它前面。
     window.addEventListener('change', onCaptureChange, true);
     window.addEventListener('click', onCaptureClick, true);
-    injectPanel();
 
     console.log(TAG, '已加载：正则预设切换只同步全局正则，不再改写角色卡与预设文件。');
 }
